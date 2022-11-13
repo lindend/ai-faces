@@ -6,6 +6,7 @@ import keras.optimizers
 import keras.layers as layers
 import keras.losses as losses
 import keras.callbacks as callbacks
+from keras.applications.convnext import LayerScale
 from keras.applications.convnext import ConvNeXtTiny
 import tensorflow as tf
 
@@ -15,6 +16,8 @@ embedding_dim = 1
 beta = 0.25
 runeager = False
 
+perceptual_loss_model_path = "ploss_v1.keras"
+
 version = 5
 model_path = f"vqvae_faces_v{version}.keras"
 
@@ -22,36 +25,49 @@ model_path = f"vqvae_faces_v{version}.keras"
 convnext = ConvNeXtTiny(weights='imagenet')
 input_layer = convnext.get_layer("input_1")
 perception_layer_names = [
-  #"convnext_tiny_stage_0_block_0_depthwise_conv",
-  "convnext_tiny_stage_0_block_0_identity",
-  #"convnext_tiny_stage_0_block_1_depthwise_conv",
-  "convnext_tiny_stage_0_block_1_identity",
-  #"convnext_tiny_stage_0_block_2_depthwise_conv",
-  "convnext_tiny_stage_0_block_2_identity",
+  "convnext_tiny_stage_0_block_0_depthwise_conv",
+  "convnext_tiny_stage_0_block_1_depthwise_conv",
+  "convnext_tiny_stage_0_block_2_depthwise_conv",
 
-  #"convnext_tiny_stage_1_block_0_depthwise_conv",
-  "convnext_tiny_stage_1_block_0_identity",
-  #"convnext_tiny_stage_1_block_1_depthwise_conv",
-  "convnext_tiny_stage_1_block_1_identity",
-  #"convnext_tiny_stage_1_block_2_depthwise_conv",
-  "convnext_tiny_stage_1_block_2_identity",
+  "convnext_tiny_stage_1_block_0_depthwise_conv",
+  "convnext_tiny_stage_1_block_1_depthwise_conv",
+  "convnext_tiny_stage_1_block_2_depthwise_conv",
+
+  "convnext_tiny_stage_2_block_0_depthwise_conv",
+  "convnext_tiny_stage_2_block_1_depthwise_conv",
+  "convnext_tiny_stage_2_block_2_depthwise_conv",
+
+  # "convnext_tiny_stage_0_block_0_identity",
+  # "convnext_tiny_stage_0_block_1_identity",
+  # "convnext_tiny_stage_0_block_2_identity",
+
+  # "convnext_tiny_stage_1_block_0_identity",
+  # "convnext_tiny_stage_1_block_1_identity",
+  # "convnext_tiny_stage_1_block_2_identity",
   
-  #"convnext_tiny_stage_2_block_0_depthwise_conv",
-  "convnext_tiny_stage_2_block_0_identity",
-  #"convnext_tiny_stage_2_block_1_depthwise_conv",
-  "convnext_tiny_stage_2_block_1_identity",
-  #"convnext_tiny_stage_2_block_2_depthwise_conv",
-  "convnext_tiny_stage_2_block_2_identity",
+  # "convnext_tiny_stage_2_block_0_identity",
+  # "convnext_tiny_stage_2_block_1_identity",
+  # "convnext_tiny_stage_2_block_2_identity",
 ]
+
+weights = [10 / (i + 1) for i in range(1, 10)]
 perception_layers = [convnext.get_layer(name) for name in perception_layer_names]
 perception_layer_outputs = [layer.output for layer in perception_layers]
 perception_activation = keras.models.Model(input_layer.input, perception_layer_outputs)
 perception_activation.summary()
 
+perceptual_loss_model = keras.models.load_model(perceptual_loss_model_path, custom_objects={
+    "LayerScale": LayerScale
+})
+
+def perceptual_loss_fn(original, generated):
+  return tf.abs(perceptual_loss_model([original, generated]))
+
 def perception_loss_fn(original, generated):
   original_activation = perception_activation(original)
   generated_activation = perception_activation(generated)
   diffs = [tf.reduce_mean((tf.nn.l2_normalize(x, axis=-1) - tf.nn.l2_normalize(x0, axis=-1)) ** 2, axis=None) for (x, x0) in zip(original_activation, generated_activation)]
+  diffs = [weights[i] * diff for i, diff in enumerate(diffs)]
   loss = sum(diffs) / len(diffs)
   return loss
 
@@ -107,7 +123,8 @@ def get_model():
     return keras.models.load_model(model_path, custom_objects={
       "VectorQuantization": VectorQuantization,
       "decoder_loss_fn": decoder_loss_fn,
-      "perception_loss_fn": perception_loss_fn
+      "perception_loss_fn": perception_loss_fn,
+      "perceptual_loss_fn": perceptual_loss_fn
     })
     
   encoder_inputs = keras.Input(shape=(*image_size, 3))
@@ -143,7 +160,7 @@ model.summary()
 model.compile(run_eagerly=runeager, loss=perception_loss_fn)
 
 dataset = keras.utils.image_dataset_from_directory(
-  "img_align_celeba_small",
+  "img_align_celeba",
   label_mode=None,
   image_size=image_size,
   batch_size=8,
@@ -179,8 +196,8 @@ for i in range(len(test_ds)):
 
 callbacks = [
   VQVaeMonitor(test_ds),
-  callbacks.ModelCheckpoint(model_path)
-  # keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+  callbacks.ModelCheckpoint(model_path),
+  # callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
 ]
 autolabeled_ds = tf.data.Dataset.zip((dataset, dataset)).shuffle(100)
 model.fit(autolabeled_ds, epochs=400, callbacks=callbacks)
