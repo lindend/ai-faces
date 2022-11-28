@@ -5,29 +5,39 @@ import keras.optimizers
 import keras.layers as layers
 import keras.losses as losses
 import keras.callbacks as callbacks
+import keras.backend as K
 import tensorflow as tf
+import numpy as np
 from keras.applications.efficientnet_v2 import EfficientNetV2B0
 import shutil
+import json
+from numpyencoder import NumpyEncoder
 
 image_size = (224, 224)
 embedding_length = 2048
-embedding_dim = 8
+embedding_dim = 4
 beta = 0.25
 runeager = False
 small_dataset = False
-ds_size = 1024
-batch_size = 8
-test_size = batch_size
+ds_size = 20048
+batch_size = 4
+test_size = 5
 epochs = 1000
 eg_learning_rate = 0.0001
 d_learning_rate = 0.0001
+discriminator_weight = 1.0
 
-version = 7
+filters = 32
+
+version = 8
 
 img_output_path = f"generated-vqgan-v{version}"
 log_dir = "logs/vqgan"
 def model_path(model):
-  return f"models/vqgan_faces_{model}_v{version}.keras"
+  return f"models/vqgan_faces_{model}_v{version}.h5"
+
+def optimizer_path(optimizer):
+  return f"models/vqgan_faces_optimizer_{optimizer}_v{version}.npz"
 
 
 if os.path.exists(os.path.join(log_dir, "train")):
@@ -69,8 +79,8 @@ class VectorQuantization(layers.Layer):
     self.embedding_dim = embedding_dim
     self.beta = beta
     self.embedding = self.add_weight("embedding",
-      shape=(embedding_length, embedding_dim), 
-      initializer=tf.random_uniform_initializer(0, 1), 
+      shape=(embedding_length, embedding_dim),
+      initializer=tf.random_uniform_initializer(-1.0, 1.0), 
       trainable=True)
 
   def call(self, input):
@@ -101,6 +111,38 @@ class VectorQuantization(layers.Layer):
       "beta": self.beta
     })
     return config
+
+class Swish(layers.Layer):
+  def call(self, x):
+    return x * K.sigmoid(x)
+
+class GroupNormalization(layers.Layer):
+  def __init__(self, num_groups = 32, epsilon=1e-7, **kwargs):
+    super().__init__(**kwargs)
+    self.num_groups = num_groups
+    self.epsilon = epsilon
+
+  def build(self, input_shape):
+    (_, _, _, C) = input_shape
+    self.channel_weights = self.add_weight("channel_weights", shape=(1, 1, 1, C), initializer=tf.random_uniform_initializer(-1.0, 1.0), trainable=True)
+    self.channel_biases = self.add_weight("channel_biases", shape=(1, 1, 1, C), initializer=tf.random_uniform_initializer(-1.0, 1.0), trainable=True)
+
+  def call(self, x):
+    (_, W, H, C) = x.shape
+    B = tf.shape(x)[0]
+    x = tf.reshape(x, shape=(B, W, H, self.num_groups, C // self.num_groups))
+    mean, var = tf.nn.moments(x, [1, 2, 4], keepdims=True)
+    x = (x - mean) / tf.sqrt(var + self.epsilon)
+    x = tf.reshape(x, shape=(B, W, H, C))
+    x = x * self.channel_weights + self.channel_biases
+    return x
+
+  def get_config(self):
+    config = super(GroupNormalization, self).get_config()
+    config.update({
+      "num_groups": self.num_groups,
+      "epsilon": self.epsilon
+    })
 
 def sum_grads(*args):
   sum = None
@@ -213,13 +255,18 @@ class VQGanMonitor(keras.callbacks.Callback):
 
 class VQGanCheckpoint(keras.callbacks.Callback):
   def on_epoch_end(self, epoch, logs=None):
-    self.model.encoder.save(model_path("encoder"))
-    self.model.decoder.save(model_path("decoder"))
-    self.model.discriminator.save(model_path("discriminator"))
+    self.model.encoder.save_weights(model_path("encoder"))
+    self.model.decoder.save_weights(model_path("decoder"))
+    self.model.discriminator.save_weights(model_path("discriminator"))
+    eg_weights = self.model.eg_optimizer.get_weights()
+    np.savez(optimizer_path("decoder"), *eg_weights)
+
+    d_weights = self.model.d_optimizer.get_weights()
+    np.savez(optimizer_path("discriminator"), *d_weights)
 
 def get_discriminator():
-  if os.path.exists(model_path("discriminator")):
-    return keras.models.load_model(model_path("discriminator"))
+  # if os.path.exists(model_path("discriminator")):
+  #   return keras.models.load_model(model_path("discriminator"), compile=False)
 
   discriminator = keras.Sequential([
     keras.Input(shape=(*image_size, 3)),
@@ -237,21 +284,44 @@ def get_discriminator():
     layers.Dropout(0.2),
     layers.Dense(2, activation="softmax")
   ], name="discriminator")
+  
+  if os.path.exists(model_path("discriminator")):
+    discriminator.load_weights(model_path("discriminator"))
+  
   return discriminator
 
 def conv_block(filters, x):
   x = layers.Conv2D(filters, kernel_size=3, padding="same", strides=2)(x)
-  x = layers.BatchNormalization()(x)
+  x = GroupNormalization()(x)
   x = layers.ReLU()(x)
   x = layers.Dropout(0.2)(x)
   x = layers.Conv2D(filters, kernel_size=3, padding="same")(x)
-  x = layers.BatchNormalization()(x)
+  x = GroupNormalization()(x)
   x = layers.ReLU()(x)
   return x
 
 def residual_block(filters, x):
   residual = x
 
+  x = GroupNormalization()(x)
+  x = Swish()(x)
+  x = layers.Conv2D(filters, kernel_size=3, strides=1, padding="same")(x)
+
+  x = GroupNormalization()(x)
+  x = Swish()(x)
+  x = layers.Dropout(0.2)(x)
+  x = layers.Conv2D(filters, kernel_size=3, strides=1, padding="same")(x)
+
+  return layers.Add()([residual, x])
+
+def downsample_block(filters, x):
+  return layers.Conv2D(filters, kernel_size=3, strides=2, padding="same")(x)
+
+def upsample_block(filters, x):
+  (_, w, h, _) = x.shape
+  x = layers.Resizing(h * 2, w * 2)(x)
+  x = layers.Conv2D(filters, kernel_size=3, strides=1, padding="same")(x)
+  return x
 
 def positional_encoding2d():
   def inner(inputs):
@@ -283,48 +353,92 @@ def positional_encoding2d():
     # Todo: the sinusoidal way from All you need is attention
   return inner
 
-def self_attention(num_heads=1, key_dim=64):
-  def inner(x):
-    pos = positional_encoding2d()(x)
-    x = layers.add([x, pos])
-    x = layers.MultiHeadAttention(num_heads, key_dim, attention_axes=(2, 3))(x, x, x)
-    return x
-  return inner
+def self_attention(x, num_heads=1, key_dim=64):
+  pos = positional_encoding2d()(x)
+  x = layers.add([x, pos])
+  x = layers.MultiHeadAttention(num_heads, key_dim, attention_axes=(2, 3))(x, x, x)
+  return x
 
 def get_encoder():
-  if os.path.exists(model_path("encoder")):
-    return keras.models.load_model(model_path("encoder"), custom_objects={
-      "VectorQuantization": VectorQuantization
-    })
+  # if os.path.exists(model_path("encoder")):
+  #   return keras.models.load_model(model_path("encoder"), compile=False, custom_objects={
+  #     "VectorQuantization": VectorQuantization,
+  #     "Swish": Swish
+  #   })
+
   encoder_inputs = keras.Input(shape=(*image_size, 3))
-  x = layers.Conv2D(128, kernel_size=3, padding="same", activation="relu")(encoder_inputs)
-  x = conv_block(128, x)
-  x = conv_block(256, x)
-  x = self_attention(num_heads=3, key_dim=256)(x)
+  x = layers.Conv2D(filters, kernel_size=3, padding="same")(encoder_inputs)
+  
+  x = residual_block(filters, x)
+  x = downsample_block(filters * 2, x)
+  x = residual_block(filters * 2, x)
+  x = downsample_block(filters * 4, x)
+
+  x = residual_block(filters * 4, x)
+  x = self_attention(x, num_heads=3, key_dim=filters * 4)
+  x = residual_block(filters * 4, x)
+
+  x = GroupNormalization()(x)
+  x = Swish()(x)
   x = layers.Conv2D(embedding_dim, kernel_size=3, padding="same")(x)
   x = VectorQuantization(embedding_length, embedding_dim)(x)
   encoder = keras.models.Model(encoder_inputs, x, name="encoder")
+
+  if os.path.exists(model_path("encoder")):
+    encoder.load_weights(model_path("encoder"))
+
   return encoder
 
 def get_decoder():
-  if os.path.exists(model_path("decoder")):
-    return keras.models.load_model(model_path("decoder"))
+  # if os.path.exists(model_path("decoder")):
+  #   return keras.models.load_model(model_path("decoder"), compile=False, custom_objects={
+  #     "Swish": Swish
+  #   })
+
   decoder_input = keras.Input(shape=(image_size[0]//4, image_size[1]//4, embedding_dim))
-  x = layers.Conv2D(256, 3, activation="relu", padding="same")(decoder_input)
-  x = layers.Conv2D(256, 3, activation="relu", padding="same")(x)
-  # x = layers.Dropout(0.2)(x)
-  x = layers.Conv2DTranspose(128, 4, strides=2, padding="same")(x)
-  x = layers.Conv2DTranspose(64, 4, strides=2, padding="same")(x)
+  x = layers.Conv2D(filters * 4, 3, padding="same")(decoder_input)
+
+  x = residual_block(filters * 4, x)
+  x = self_attention(x, num_heads=3, key_dim=filters * 4)
+  x = residual_block(filters * 4, x)
+
+  x = residual_block(filters * 4, x)
+  x = upsample_block(filters * 2, x)
+  x = residual_block(filters * 2, x)
+  x = upsample_block(filters, x)
+
+  x = GroupNormalization()(x)
+  x = Swish()(x)
   decoder_output = layers.Conv2D(3, 3, padding="same")(x)
 
   decoder = keras.models.Model(decoder_input, decoder_output, name="decoder")
+  
+  if os.path.exists(model_path("decoder")):
+    decoder.load_weights(model_path("decoder"))
+
   return decoder
 
 encoder = get_encoder()
+encoder.summary()
 decoder = get_decoder()
+decoder.summary()
 discriminator = get_discriminator()
+discriminator.summary()
 
-model = VQGAN(encoder, decoder, discriminator)
+enc_dec = keras.Model(encoder.inputs, decoder(encoder.outputs))
+
+model = VQGAN(encoder, decoder, discriminator, discriminator_weight)
+
+def set_optimizer_weights(optimizer, model, name, **kwargs):
+  optimizer = keras.optimizers.Adam(**kwargs)
+
+  if os.path.exists(optimizer_path(name)):
+    file = np.load(optimizer_path(name))
+    weights = [file[n] for n in file.files]
+    optimizer._create_all_weights(model.trainable_variables)
+    optimizer.set_weights(weights)
+
+  return optimizer
 
 model.compile(
   eg_optimizer=keras.optimizers.Adam(learning_rate=eg_learning_rate),
@@ -332,6 +446,9 @@ model.compile(
   loss_fn=keras.losses.SparseCategoricalCrossentropy(),
   perceptual_loss_fn=perceptual_loss_fn,
   run_eagerly=runeager)
+
+set_optimizer_weights(model.eg_optimizer, enc_dec, "decoder")
+set_optimizer_weights(model.d_optimizer, model.discriminator, "discriminator")
 
 dataset = keras.utils.image_dataset_from_directory(
   f"img_align_celeba{'_small' if small_dataset else ''}",
@@ -342,8 +459,8 @@ dataset = keras.utils.image_dataset_from_directory(
   shuffle=False
 )
 dataset = dataset.map(lambda x: x / (255. / 2) - 1.)
-test_ds = dataset.take(1).as_numpy_iterator().next()[:test_size]
-dataset = dataset.skip(1)
+test_ds = dataset.take(3).as_numpy_iterator()
+dataset = dataset.skip(3)
 
 ds_total_size = dataset.__len__()
 split_size = ds_total_size // 2
@@ -355,9 +472,16 @@ dataset = tf.data.Dataset.zip(((eg_data, disc_data),))
 
 os.makedirs(img_output_path, exist_ok=True)
 
-for i in range(len(test_ds)):
-  img = keras.utils.array_to_img(test_ds[i])
+test_imgs = []
+for batch in test_ds:
+  test_imgs.extend(batch)
+
+test_imgs = test_imgs[:test_size]
+for i, img in enumerate(test_imgs):
+  img = keras.utils.array_to_img(img)
   img.save(os.path.join(img_output_path,  f"aaref_{i}.png"))
+
+test_imgs = tf.stack(test_imgs)
 
 # log_dir = "logs/dbg"
 # tf.debugging.experimental.enable_dump_debug_info(
@@ -366,7 +490,7 @@ for i in range(len(test_ds)):
 #     circular_buffer_size=-1)
 
 callbacks = [
-  VQGanMonitor(test_ds),
+  VQGanMonitor(test_imgs),
   #callbacks.ModelCheckpoint(model_path),
   VQGanCheckpoint(),
   callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)

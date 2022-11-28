@@ -13,8 +13,13 @@ images/
 aclImdb/
 glove.6B/
 img_align_celeba/
+img_align_celeba_small/
 spa-eng/
 list_attr_celeba.txt
+data-*/
+
+logs/
+models/
 
 
 # Results
