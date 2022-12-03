@@ -17,6 +17,7 @@ img_align_celeba_small/
 spa-eng/
 list_attr_celeba.txt
 data-*/
+datasets/
 
 logs/
 models/
